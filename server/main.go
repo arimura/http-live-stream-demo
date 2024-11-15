@@ -1,208 +1,160 @@
 package main
 
 import (
-	"bytes"
-	"fmt"
-	"io"
+	"image"
+	"io/fs"
 	"log"
 	"net/http"
+	"os"
 	"os/exec"
-	"sync"
+	"path/filepath"
+	"strconv"
+	"time"
 
 	"gocv.io/x/gocv"
 )
 
-var (
-	cameraIndex int = 0 // Default camera index
-	frameWidth  int = 640
-	frameHeight int = 480
-	fps         int = 30
-)
-
-// MemoryStore holds the HLS segments in memory.
-type MemoryStore struct {
-	mutex    sync.RWMutex
-	segments map[string][]byte
-	playlist []byte
-}
-
-var store = &MemoryStore{
-	segments: make(map[string][]byte),
-}
-
 func main() {
-	// Open default camera
-	capture, err := gocv.OpenVideoCapture(cameraIndex)
+	// Open the default camera using device ID 0
+	webcam, err := gocv.OpenVideoCapture(0)
 	if err != nil {
-		log.Fatalf("Error opening video capture device: %v", err)
+		log.Fatalf("Error opening webcam: %v", err)
 	}
-	defer capture.Close()
+	defer webcam.Close()
 
-	// Set camera properties
-	capture.Set(gocv.VideoCaptureFrameWidth, float64(frameWidth))
-	capture.Set(gocv.VideoCaptureFrameHeight, float64(frameHeight))
-	capture.Set(gocv.VideoCaptureFPS, float64(fps))
+	// Read initial frame to retrieve camera properties
+	frame := gocv.NewMat()
+	if ok := webcam.Read(&frame); !ok || frame.Empty() {
+		log.Fatalf("Cannot read frame from webcam. Is the camera accessible?")
+	}
+	defer frame.Close()
 
-	// Start HLS Encoding
-	log.Println("Starting FFmpeg for HLS encoding...")
-	cmd := exec.Command("ffmpeg",
-		"-f", "rawvideo", // input format is raw video frames
-		"-pix_fmt", "bgr24", // pixel format for the frames
-		"-s", fmt.Sprintf("%dx%d", frameWidth, frameHeight), // frame size
-		"-r", fmt.Sprintf("%d", fps), // frame rate
-		"-i", "-", // read input from stdin (pipe)
-		"-c:v", "libx264", // video codec
-		"-preset", "veryfast", // encoding preset
-		"-g", fmt.Sprintf("%d", fps*2), // keyframe interval (for segmenting)
-		"-sc_threshold", "0",
-		"-f", "hls", // output format HLS
-		"-hls_list_size", "3", // number of segments in playlist
-		"-hls_time", "2", // segment length in seconds
-		"-hls_flags", "delete_segments", // remove old segments
-		"-method", "PUT", // method used for segments
-		"-hls_segment_filename", "http://localhost:8080/segment_%03d.ts",
-		"http://localhost:8080/index.m3u8", // M3U8 playlist
+	// Retrieve the camera frame dimensions
+	frameWidth := frame.Cols()
+	frameHeight := frame.Rows()
+	if frameWidth == 0 || frameHeight == 0 {
+		log.Fatalf("Invalid frame dimensions: width=%d, height=%d", frameWidth, frameHeight)
+	}
+
+	log.Printf("Camera frame dimensions: %dx%d\n", frameWidth, frameHeight)
+
+	// Create a directory for HLS output if it doesn't exist
+	hlsDirectory := "hls"
+	if err := os.MkdirAll(hlsDirectory, fs.ModePerm); err != nil {
+		log.Fatalf("Error creating HLS directory: %v", err)
+	}
+
+	// Prepare FFmpeg command to produce an HLS stream
+	ffmpegCmd := exec.Command(
+		"ffmpeg",
+		"-hide_banner",
+		"-loglevel", "error", // hide FFmpeg logs, set "info" or remove for debugging
+		"-f", "rawvideo",
+		"-pix_fmt", "bgr24",
+		"-s", formatResolution(frameWidth, frameHeight),
+		"-r", "30", // frame rate
+		"-i", "pipe:0", // input from stdin
+		// Video codec parameters
+		"-c:v", "libx264",
+		"-preset", "veryfast",
+		"-tune", "zerolatency",
+		"-g", "30", // group of pictures (GOP) size
+		// HLS parameters
+		"-f", "hls",
+		"-hls_time", "2",
+		"-hls_list_size", "3",
+		"-hls_flags", "delete_segments", // optional: deletes old segments
+		"-hls_segment_filename", filepath.Join(hlsDirectory, "segment_%03d.ts"),
+		filepath.Join(hlsDirectory, "index.m3u8"),
 	)
 
-	// Set up a pipe for video data to ffmpeg's stdin
-	ffmpegIn, err := cmd.StdinPipe()
+	// Setup FFmpeg stdout and stderr to monitor for errors
+	ffmpegStdout, err := ffmpegCmd.StdoutPipe()
 	if err != nil {
-		log.Fatalf("Error creating FFmpeg stdin pipe: %v", err)
-	}
-	cmd.Stdout = &pipeWriter{onWrite: savePlaylist}
-	cmd.Stderr = io.MultiWriter(log.Writer(), &pipeWriter{onWrite: savePlaylist}) // For debugging
-
-	// Start ffmpeg command
-	if err := cmd.Start(); err != nil {
-		log.Fatalf("Error starting ffmpeg: %v", err)
+		log.Fatalf("Error creating StdoutPipe for FFmpeg: %v", err)
 	}
 
-	// Capture frames and write to ffmpeg's stdin
+	ffmpegStderr, err := ffmpegCmd.StderrPipe()
+	if err != nil {
+		log.Fatalf("Error creating StderrPipe for FFmpeg: %v", err)
+	}
+
+	// Setup FFmpeg stdin
+	ffmpegIn, err := ffmpegCmd.StdinPipe()
+	if err != nil {
+		log.Fatalf("Error getting FFmpeg stdin pipe: %v", err)
+	}
+
+	// Start FFmpeg process
+	if err := ffmpegCmd.Start(); err != nil {
+		log.Fatalf("Error starting FFmpeg command: %v", err)
+	}
+
+	// Monitor FFmpeg outputs in goroutines (optional, but useful for debugging)
 	go func() {
-		defer ffmpegIn.Close()
-
-		img := gocv.NewMat()
-		defer img.Close()
-
 		for {
-			if ok := capture.Read(&img); !ok {
-				log.Println("Error: cannot read frame from camera")
-				continue
-			}
-			if img.Empty() {
-				continue
-			}
-
-			_, err := ffmpegIn.Write(img.ToBytes())
+			buf := make([]byte, 1024)
+			n, err := ffmpegStdout.Read(buf)
 			if err != nil {
-				log.Printf("Error writing frame to ffmpeg: %v", err)
-				return
+				break
 			}
+			log.Printf("FFmpeg stdout: %s", string(buf[:n]))
 		}
 	}()
 
-	// Define HTTP routes
-	http.HandleFunc("/", indexHandler)
-	http.HandleFunc("/index.m3u8", playlistHandler)
-	http.HandleFunc("/segment_", segmentHandler)
-
-	// Start the HTTP server
-	port := "8080"
-	log.Printf("HLS live stream server running at http://localhost:%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
-}
-
-// Handler for the root page - returns an HTML page with the video feed
-func indexHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	html := `
-<html>
-  <head>
-    <title>Webcam Live Stream (HLS)</title>
-  </head>
-  <body>
-    <h1>Webcam Live Stream (HLS)</h1>
-    <video width="640" height="480" controls autoplay>
-      <source src="/index.m3u8" type="application/x-mpegURL">
-    </video>
-  </body>
-</html>
-`
-	w.Write([]byte(html))
-}
-
-// Handler for the HLS playlist (index.m3u8)
-func playlistHandler(w http.ResponseWriter, r *http.Request) {
-	store.mutex.RLock()
-	defer store.mutex.RUnlock()
-
-	if len(store.playlist) == 0 {
-		http.Error(w, "Playlist not yet available", http.StatusServiceUnavailable)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-	w.Write(store.playlist)
-}
-
-// Handler for HLS segments (segment_XXX.ts)
-func segmentHandler(w http.ResponseWriter, r *http.Request) {
-	segmentName := r.URL.Path[1:] // e.g. "segment_001.ts"
-
-	switch r.Method {
-	case http.MethodPut:
-		// FFmpeg will PUT segment data here
-		var buf bytes.Buffer
-		if _, err := io.Copy(&buf, r.Body); err != nil {
-			log.Printf("Error reading segment data: %v", err)
-			http.Error(w, "Error reading segment data", http.StatusInternalServerError)
-			return
+	go func() {
+		for {
+			buf := make([]byte, 1024)
+			n, err := ffmpegStderr.Read(buf)
+			if err != nil {
+				break
+			}
+			log.Printf("FFmpeg stderr: %s", string(buf[:n]))
 		}
-		store.mutex.Lock()
-		store.segments[segmentName] = buf.Bytes()
-		store.mutex.Unlock()
-		w.WriteHeader(http.StatusCreated)
-		w.Write([]byte("OK"))
+	}()
 
-	case http.MethodGet:
-		// Client requests segment data
-		store.mutex.RLock()
-		segmentData, ok := store.segments[segmentName]
-		store.mutex.RUnlock()
-		if !ok {
-			http.Error(w, "Segment not found", http.StatusNotFound)
-			return
+	// Capture frames and send to FFmpeg
+	go func() {
+		defer ffmpegIn.Close()
+
+		// Re-use the frame Mat for capturing subsequent frames
+		for {
+			if ok := webcam.Read(&frame); !ok {
+				log.Println("Cannot read frame from webcam")
+				break
+			}
+			if frame.Empty() {
+				continue
+			}
+
+			// Ensure frame dimensions match what we told FFmpeg
+			// If not, we can resize or handle dynamically
+			if frame.Cols() != frameWidth || frame.Rows() != frameHeight {
+				gocv.Resize(frame, &frame, image.Point{X: frameWidth, Y: frameHeight}, 0, 0, gocv.InterpolationLinear)
+			}
+
+			// Write frame data to FFmpeg's stdin
+			_, err := ffmpegIn.Write(frame.ToBytes())
+			if err != nil {
+				log.Printf("Error writing frame to FFmpeg: %v", err)
+				break
+			}
+
+			// Sleep for the required frame interval based on the frame rate
+			time.Sleep(time.Second / 30) // 30fps
 		}
-		w.Header().Set("Content-Type", "video/mp2t")
-		w.Write(segmentData)
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}()
+
+	// Serve the HLS files
+	http.Handle("/", http.FileServer(http.Dir(hlsDirectory)))
+
+	log.Println("Starting server on http://localhost:8080 (Press CTRL+C to exit)")
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		log.Fatalf("HTTP server error: %v", err)
 	}
 }
 
-// Save playlist or logs from ffmpeg
-func savePlaylist(p []byte) {
-	data := string(p)
-	if len(data) > 0 && data[0] == '#' {
-		// M3U8 lines start with '#'
-		store.mutex.Lock()
-		store.playlist = append(store.playlist, p...)
-		store.playlist = append(store.playlist, '\n')
-		store.mutex.Unlock()
-	} else {
-		// This might be ffmpeg logs
-		log.Println("FFmpeg output: ", data)
-	}
-}
-
-// pipeWriter is used to capture ffmpeg output
-type pipeWriter struct {
-	onWrite func([]byte)
-}
-
-func (p *pipeWriter) Write(data []byte) (int, error) {
-	if p.onWrite != nil {
-		p.onWrite(data)
-	}
-	return len(data), nil
+// formatResolution returns a string representation of the resolution for FFmpeg (e.g., "640x480")
+func formatResolution(width, height int) string {
+	return strconv.Itoa(width) + "x" + strconv.Itoa(height)
 }
