@@ -145,8 +145,26 @@ func main() {
 		}
 	}()
 
-	// Serve the HLS files
-	http.Handle("/", http.FileServer(http.Dir(hlsDirectory)))
+	// Serve the HTML page at root "/"
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		htmlContent := `<!DOCTYPE html>
+<html>
+<head>
+    <title>Webcam Stream</title>
+    <meta charset="UTF-8">
+</head>
+<body>
+    <h1>Webcam Stream</h1>
+    <video id="video" width="640" height="480" controls autoplay src="/hls/index.m3u8" type="application/vnd.apple.mpegurl"></video>
+    <p>If the video does not play, your browser might not support HLS natively.</p>
+</body>
+</html>`
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(htmlContent))
+	})
+
+	// Serve the HLS files at "/hls/"
+	http.Handle("/hls/", http.StripPrefix("/hls/", http.FileServer(http.Dir(hlsDirectory))))
 
 	log.Println("Starting server on http://localhost:8080 (Press CTRL+C to exit)")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
